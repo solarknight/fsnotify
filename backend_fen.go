@@ -231,6 +231,11 @@ func (w *Watcher) AddWith(name string, opts ...addOpt) error {
 		return nil
 	}
 
+	_, recurse := recursivePath(name)
+	if recurse {
+		return ErrRecursionUnsupported
+	}
+
 	_ = getOptions(opts...)
 
 	// Currently we resolve symlinks that were explicitly requested to be

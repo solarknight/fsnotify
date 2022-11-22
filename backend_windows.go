@@ -237,6 +237,11 @@ func (w *Watcher) AddWith(name string, opts ...addOpt) error {
 		return ErrClosed
 	}
 
+	_, recurse := recursivePath(name)
+	if recurse {
+		return ErrRecursionUnsupported
+	}
+
 	with := getOptions(opts...)
 	if with.bufsize < 4096 {
 		return fmt.Errorf("fsnotify.WithBufferSize: buffer size cannot be smaller than 4096 bytes")

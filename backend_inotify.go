@@ -118,9 +118,14 @@ type Watcher struct {
 	mu          sync.Mutex // Map access
 	inotifyFile *os.File
 	watches     map[string]*watch // Map of inotify watches (path → watch)
-	paths       map[int]string    // Map of watched paths (watch descriptor → path)
+	paths       map[int]watchPath // Map of watched paths (watch descriptor → watchPath)
 	done        chan struct{}     // Channel for sending a "quit message" to the reader goroutine
 	doneResp    chan struct{}     // Channel to respond to Close
+}
+
+type watchPath struct {
+	path    string
+	recurse bool
 }
 
 // NewWatcher creates a new Watcher.
@@ -137,7 +142,7 @@ func NewWatcher() (*Watcher, error) {
 		fd:          fd,
 		inotifyFile: os.NewFile(uintptr(fd), ""),
 		watches:     make(map[string]*watch),
-		paths:       make(map[int]string),
+		paths:       make(map[int]watchPath),
 		Events:      make(chan Event),
 		Errors:      make(chan error),
 		done:        make(chan struct{}),
@@ -253,6 +258,25 @@ func (w *Watcher) AddWith(name string, opts ...addOpt) error {
 	name = filepath.Clean(name)
 	_ = getOptions(opts...)
 
+	name, recurse := recursivePath(name)
+	if recurse {
+		dirs, err := findDirs(name)
+		if err != nil {
+			return err
+		}
+		for _, d := range dirs {
+			err := w.add(d, true)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	return w.add(name, false)
+}
+
+func (w *Watcher) add(path string, recurse bool) error {
 	var flags uint32 = unix.IN_MOVED_TO | unix.IN_MOVED_FROM |
 		unix.IN_CREATE | unix.IN_ATTRIB | unix.IN_MODIFY |
 		unix.IN_MOVE_SELF | unix.IN_DELETE | unix.IN_DELETE_SELF |
@@ -260,18 +284,18 @@ func (w *Watcher) AddWith(name string, opts ...addOpt) error {
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	watchEntry := w.watches[name]
+	watchEntry := w.watches[path]
 	if watchEntry != nil {
 		flags |= watchEntry.flags | unix.IN_MASK_ADD
 	}
-	wd, errno := unix.InotifyAddWatch(w.fd, name, flags)
+	wd, errno := unix.InotifyAddWatch(w.fd, path, flags)
 	if wd == -1 {
 		return errno
 	}
 
 	if watchEntry == nil {
-		w.watches[name] = &watch{wd: uint32(wd), flags: flags}
-		w.paths[wd] = name
+		w.watches[path] = &watch{wd: uint32(wd), flags: flags}
+		w.paths[wd] = watchPath{path: path, recurse: recurse}
 	} else {
 		watchEntry.wd = uint32(wd)
 		watchEntry.flags = flags
@@ -423,7 +447,8 @@ func (w *Watcher) readEvents() {
 			// the "Name" field with a valid filename. We retrieve the path of the watch from
 			// the "paths" map.
 			w.mu.Lock()
-			name, ok := w.paths[int(raw.Wd)]
+			watchPath, ok := w.paths[int(raw.Wd)]
+			name := watchPath.path
 			// inotify will automatically remove the watch on deletes; just need
 			// to clean our state here.
 			if ok && mask&unix.IN_DELETE_SELF == unix.IN_DELETE_SELF {
@@ -465,13 +490,51 @@ func (w *Watcher) readEvents() {
 	}
 }
 
+// Check if path was added as a recursive watch ("dir/...").
+//
+// Returns the watch for the path, or nil.
+func (w *Watcher) isRecursive(path string) *watch {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	ww, ok := w.watches[path]
+	if !ok {
+		// path could be a file, so also check the Dir.
+		path = filepath.Dir(path)
+		ww, ok = w.watches[path]
+		if !ok {
+			return nil
+		}
+	}
+	if !w.paths[int(ww.wd)].recurse {
+		return nil
+	}
+	return ww
+}
+
 // newEvent returns an platform-independent Event based on an inotify mask.
 func (w *Watcher) newEvent(name string, mask uint32) Event {
 	e := Event{Name: name}
 	if mask&unix.IN_CREATE == unix.IN_CREATE || mask&unix.IN_MOVED_TO == unix.IN_MOVED_TO {
 		e.Op |= Create
+
+		// Add new directories on recursive watches.
+		if mask&unix.IN_ISDIR == unix.IN_ISDIR {
+			ww := w.isRecursive(name)
+			if ww != nil {
+				//err := w.add(name, true)
+				err := w.Add(filepath.Join(name, "..."))
+				if err != nil {
+					// TODO: not sure if this has a nice error message.
+					//       Also, this path could have been removed by now;
+					//       should probably filter ENOENT or something.
+					w.sendError(err)
+				}
+			}
+		}
 	}
 	if mask&unix.IN_DELETE_SELF == unix.IN_DELETE_SELF || mask&unix.IN_DELETE == unix.IN_DELETE {
+		// TODO: remove recursive watches.
 		e.Op |= Remove
 	}
 	if mask&unix.IN_MODIFY == unix.IN_MODIFY {
@@ -479,6 +542,20 @@ func (w *Watcher) newEvent(name string, mask uint32) Event {
 	}
 	if mask&unix.IN_MOVE_SELF == unix.IN_MOVE_SELF || mask&unix.IN_MOVED_FROM == unix.IN_MOVED_FROM {
 		e.Op |= Rename
+
+		//if mask&unix.IN_ISDIR == unix.IN_ISDIR {
+		// TODO: should probably remove some things as well.
+		// ww := w.isRecursive(name)
+		// if ww != nil {
+		// 	err := w.Add(filepath.Join(name, "..."))
+		// 	if err != nil {
+		// 		// TODO: not sure if this has a nice error message.
+		// 		//       Also, this path could have been removed by now;
+		// 		//       should probably filter ENOENT or something.
+		// w.sendError(err)
+		// 	}
+		// }
+		//}
 	}
 	if mask&unix.IN_ATTRIB == unix.IN_ATTRIB {
 		e.Op |= Chmod

@@ -1273,3 +1273,173 @@ func TestWatchList(t *testing.T) {
 		t.Errorf("\nhave: %s\nwant: %s", have, want)
 	}
 }
+
+func TestFindDirs(t *testing.T) {
+	join := func(list ...string) string {
+		return "\n\t" + strings.Join(list, "\n\t")
+	}
+
+	t.Run("finds dirs", func(t *testing.T) {
+		tmp := t.TempDir()
+
+		mkdirAll(t, tmp, "/one/two/three/four")
+		cat(t, "asd", tmp, "one/two/file.txt")
+		symlink(t, "/", tmp, "link")
+
+		dirs, err := findDirs(tmp)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		have := join(dirs...)
+		want := join([]string{
+			tmp,
+			filepath.Join(tmp, "one"),
+			filepath.Join(tmp, "one/two"),
+			filepath.Join(tmp, "one/two/three"),
+			filepath.Join(tmp, "one/two/three/four"),
+		}...)
+
+		if have != want {
+			t.Errorf("\nhave: %s\nwant: %s", have, want)
+		}
+	})
+
+	t.Run("file", func(t *testing.T) {
+		tmp := t.TempDir()
+		cat(t, "asd", tmp, "file")
+
+		dirs, err := findDirs(filepath.Join(tmp, "file"))
+		if !errorContains(err, "not a directory") {
+			t.Errorf("wrong error: %s", err)
+		}
+		if len(dirs) > 0 {
+			t.Errorf("dirs contains entries: %s", dirs)
+		}
+	})
+}
+
+func TestWatcherRecursive(t *testing.T) {
+	switch runtime.GOOS {
+	case "linux":
+		// Run test.
+	default:
+		// Ensure we get correct error.
+		tmp := t.TempDir()
+		w := newWatcher(t)
+		err := w.Add(filepath.Join(tmp, "..."))
+		if !errors.Is(err, ErrRecursionUnsupported) {
+			t.Errorf("wrong error: %s", err)
+		}
+		return
+	}
+
+	// inotify(7):
+	// Inotify monitoring of directories is not recursive: to monitor
+	// subdirectories under a directory, additional watches must be created.
+	// This can take a significant amount time for large directory trees.
+	//
+	// If monitoring an entire directory subtree, and a new subdirectory is
+	// created in that tree or an existing directory is renamed into that
+	// tree, be aware that by the time you create a watch for the new
+	// subdirectory, new files (and subdirectories) may already exist inside
+	// the subdirectory.  Therefore, you may want to scan the contents of the
+	// subdirectory immediately after adding the watch (and, if desired,
+	// recursively add watches for any subdirectories that it contains).
+
+	tests := []testCase{
+		// Make a nested directory tree, then write some files there.
+		{"basic", func(t *testing.T, w *Watcher, tmp string) {
+			mkdirAll(t, tmp, "/one/two/three/four")
+			addWatch(t, w, tmp, "/...")
+
+			cat(t, "asd", tmp, "/file.txt")
+			cat(t, "asd", tmp, "/one/two/three/file.txt")
+		}, `
+			CREATE  "/file.txt"
+			WRITE   "/file.txt"
+			CREATE  "/one/two/three/file.txt"
+			WRITE   "/one/two/three/file.txt"
+		`},
+
+		{"add directory", func(t *testing.T, w *Watcher, tmp string) {
+			mkdirAll(t, tmp, "/one/two/three/four")
+			addWatch(t, w, tmp, "/...")
+
+			mkdirAll(t, tmp, "/one/two/new/dir")
+			touch(t, tmp, "/one/two/new/file")
+			touch(t, tmp, "/one/two/new/dir/file")
+		}, `
+			# TODO: don't see the new/dir being created.
+			CREATE   "/one/two/new"
+			CREATE   "/one/two/new/file"
+			CREATE   "/one/two/new/dir/file"
+		`},
+
+		// Remove nested directory
+		{"remove directory", func(t *testing.T, w *Watcher, tmp string) {
+			mkdirAll(t, tmp, "/one/two/three/four")
+			addWatch(t, w, tmp, "...")
+
+			cat(t, "asd", tmp, "one/two/three/file.txt")
+			rmAll(t, tmp, "one/two")
+		}, `
+			# TODO: this includes many duplicate events as we get a
+			#       notification both for the watch on the directory itself
+			#       as well as the parent that watches the directory.
+			CREATE   "/one/two/three/file.txt"
+			WRITE    "/one/two/three/file.txt"
+			REMOVE   "/one/two/three/file.txt"
+			REMOVE   "/one/two/three/four"
+			REMOVE   "/one/two/three/four"
+			REMOVE   "/one/two/three"
+			REMOVE   "/one/two/three"
+			REMOVE   "/one/two"
+			REMOVE   "/one/two"
+		`},
+
+		// Rename nested directory
+		{"rename directory", func(t *testing.T, w *Watcher, tmp string) {
+			mkdirAll(t, tmp, "/one/two/three/four")
+			addWatch(t, w, tmp, "...")
+
+			mv(t, filepath.Join(tmp, "one"), tmp, "one-rename")
+			touch(t, tmp, "one-rename/file")
+			touch(t, tmp, "one-rename/two/three/file")
+		}, `
+			# TODO: rename + create + rename doesn't seem quite right?
+			RENAME   "/one"
+			CREATE   "/one-rename"
+			RENAME   "/one-rename"
+			CREATE   "/one-rename/file"
+			CREATE   "/one-rename/two/three/file"
+		`},
+
+		// TODO: rest that Remove doesn't keep watching stuff
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		tt.run(t)
+
+		// t.Run(tt.name, func(t *testing.T) {
+		// 	t.Parallel()
+		// 	tmp := t.TempDir()
+		// 	w := newCollector(t)
+
+		// 	tt.preWatch(t, tmp)
+		// 	addWatch(t, w.w, tmp, "...")
+		// 	tt.postWatch(t, tmp)
+
+		// 	w.collect(t)
+		// 	have := w.stop(t)
+		// 	for i := range have {
+		// 		have[i].Name = strings.TrimPrefix(have[i].Name, tmp)
+		// 	}
+
+		// 	if have.String() != tt.want.String() {
+		// 		t.Errorf("\nhave:\n%s\nwant:\n%s", have, tt.want)
+		// 	}
+		// })
+	}
+}

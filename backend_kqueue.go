@@ -277,6 +277,11 @@ func (w *Watcher) Add(name string) error { return w.AddWith(name) }
 //   - [WithBufferSize] sets the buffer size for the Windows backend; no-op on
 //     other platforms. The default is 64K (65536 bytes).
 func (w *Watcher) AddWith(name string, opts ...addOpt) error {
+	_, recurse := recursivePath(name)
+	if recurse {
+		return ErrRecursionUnsupported
+	}
+
 	_ = getOptions(opts...)
 
 	w.mu.Lock()
